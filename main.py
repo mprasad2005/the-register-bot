@@ -61,6 +61,13 @@ def single_back(callback_data="back_main", text="🔙 Back"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback_data, style="primary")]])
 
 
+def format_registration_names(poll_id):
+    rows = db.registrations(poll_id)
+    if not rows:
+        return "None"
+    return "\n".join(f"{index}. {row['name']}" for index, row in enumerate(rows, 1))
+
+
 async def pin_message(context, chat_id, message_id):
     try:
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -340,7 +347,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not poll or poll["status"] != "registration":
             await q.edit_message_text("❌ Registration not found/open.", reply_markup=single_back("admin_finishreg")); return
         db.close_registration(pid)
-        await q.edit_message_text(f"✅ *Registration closed*\n\nPoll #{pid}\n👥 Registered: {db.registration_count(pid)}/{poll['slots']}\n\nNow use 🗳 Main Poll to post the actual Telegram poll.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗳 Main Poll", callback_data="admin_mainpoll", style="success")],[InlineKeyboardButton("🔙 Admin Panel", callback_data="back_admin", style="primary")]])); return
+        names = format_registration_names(pid)
+        await try_group_message(context, poll["group_id"], f"✅ Registration closed for poll #{pid}.\n\nRegistered people:\n{names}")
+        await q.edit_message_text(f"✅ Registration closed\n\nPoll #{pid}\n👥 Registered: {db.registration_count(pid)}/{poll['slots']}\n\nRegistered people:\n{names}\n\nNow use 🗳 Main Poll to post the actual Telegram poll.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗳 Main Poll", callback_data="admin_mainpoll", style="success")],[InlineKeyboardButton("🔙 Admin Panel", callback_data="back_admin", style="primary")]])); return
 
     # ADMIN: MAIN TELEGRAM POLL
     if data == "admin_mainpoll":
@@ -426,18 +435,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not polls:
             await q.edit_message_text("No registrations yet.", reply_markup=single_back("admin_regs")); return
         kb=[]
-        for p in polls:
-            kb.append([InlineKeyboardButton(f"#{p['id']} — {p['question'][:30]} ({db.registration_count(p['id'])})", callback_data=f"reglist:{p['id']}", style="primary")])
+        active_polls = [p for p in polls if p["status"] != "completed"]
+        past_polls = [p for p in polls if p["status"] == "completed"]
+        for p in active_polls:
+            kb.append([InlineKeyboardButton(f"🟢 #{p['id']} — {p['question'][:30]} ({db.registration_count(p['id'])})", callback_data=f"reglist:{p['id']}", style="primary")])
+        for p in past_polls:
+            kb.append([InlineKeyboardButton(f"📁 #{p['id']} — {p['question'][:30]} ({db.registration_count(p['id'])})", callback_data=f"reglist:{p['id']}", style="primary")])
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_regs", style="primary")])
-        await q.edit_message_text("👥 Select poll:", reply_markup=InlineKeyboardMarkup(kb)); return
+        await q.edit_message_text("👥 Select poll to view registered users:\n\n🟢 Active polls\n📁 Past polls", reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("reglist:"):
         pid=int(data.split(":")[1]); poll=db.get_poll(pid); rows=db.registrations(pid)
-        lines=[f"👥 *Poll #{pid}*",f"🗳️ {poll['question']}",f"🎟️ Slots: {poll['slots']}",f"👤 Registered: {len(rows)}","", "*Registered users:*" ]
+        if not poll:
+            await q.edit_message_text("❌ Poll not found.", reply_markup=single_back("admin_regs")); return
+        lines=[f"👥 Poll #{pid}",f"🗳️ {poll['question']}",f"🎟️ Slots: {poll['slots']}",f"👤 Registered: {len(rows)}","", "Registered users:" ]
         for i,r in enumerate(rows,1):
-            username = f"@{r['username']}" if r.get('username') else "No username"
-            lines.append(f"{i}. {r['name']} | {username} | ID: `{r['user_id']}`")
+            username = f"@{r['username']}" if r['username'] else "No username"
+            lines.append(f"{i}. {r['name']} | {username} | ID: {r['user_id']}")
         if not rows: lines.append("None")
-        await q.edit_message_text("\n".join(lines)[:4000], parse_mode="Markdown", reply_markup=single_back(f"areg:{poll['group_id']}")); return
+        await q.edit_message_text("\n".join(lines)[:4000], reply_markup=single_back(f"areg:{poll['group_id']}")); return
 
     if data == "admin_results":
         polls=db.completed_polls_all()
@@ -525,7 +540,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok,reason,count,slots=db.register(pid,uid,text)
         if ok:
             msg=f"✅ Registration successful!\n\n👥 Registered: {count}/{slots}"
-            if slots and count>=slots: msg += "\n🛑 Slots full — registration closed automatically."
+            if slots and count>=slots:
+                names = format_registration_names(pid)
+                msg += f"\n🛑 Slots full — registration closed automatically.\n\nRegistered people:\n{names}"
+                poll = db.get_poll(pid)
+                await try_group_message(context, poll["group_id"], f"✅ Registration is complete for poll #{pid}.\n\nRegistered people:\n{names}")
         elif reason=="duplicate": msg="⚠️ You are already registered for this poll."
         elif reason=="full": msg=f"🛑 All {slots} slots are full. Registration is closed."
         else: msg="❌ Registration is closed."
