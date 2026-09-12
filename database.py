@@ -23,13 +23,34 @@ def init_db(initial_admin_ids=()):
     CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY,added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS poll_votes (poll_id INTEGER NOT NULL,user_id INTEGER NOT NULL,option_ids TEXT NOT NULL,answered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(poll_id,user_id),FOREIGN KEY(poll_id) REFERENCES polls(id));
     CREATE TABLE IF NOT EXISTS poll_results (poll_id INTEGER PRIMARY KEY,valid_counts TEXT NOT NULL,invalid_total INTEGER NOT NULL DEFAULT 0,checked_total INTEGER NOT NULL DEFAULT 0,telegram_total INTEGER NOT NULL DEFAULT 0,verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(poll_id) REFERENCES polls(id));
+    CREATE TABLE IF NOT EXISTS giveaways (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL,
+        winner_text TEXT, winner_media_type TEXT, winner_media_id TEXT, winner_caption TEXT,
+        status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, published_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS announcement_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_by INTEGER NOT NULL, source_chat_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued', total INTEGER NOT NULL DEFAULT 0,
+        sent INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS announcement_deliveries (
+        job_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, queue_no INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+        sent_at TEXT, claimed_at TEXT, PRIMARY KEY(job_id,chat_id), FOREIGN KEY(job_id) REFERENCES announcement_jobs(id)
+    );
     """)
     cols={r[1] for r in con.execute("PRAGMA table_info(polls)").fetchall()}
     group_cols={r[1] for r in con.execute("PRAGMA table_info(groups)").fetchall()}
+    giveaway_cols={r[1] for r in con.execute("PRAGMA table_info(giveaways)").fetchall()}
     if "username" not in group_cols: con.execute("ALTER TABLE groups ADD COLUMN username TEXT")
     if "telegram_poll_id" not in cols: con.execute("ALTER TABLE polls ADD COLUMN telegram_poll_id TEXT")
     if "slots" not in cols: con.execute("ALTER TABLE polls ADD COLUMN slots INTEGER NOT NULL DEFAULT 0")
     if "registration_required" not in cols: con.execute("ALTER TABLE polls ADD COLUMN registration_required INTEGER NOT NULL DEFAULT 1")
+    if "winner_media_type" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_media_type TEXT")
+    if "winner_media_id" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_media_id TEXT")
+    if "winner_caption" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_caption TEXT")
     con.executemany("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", ((user_id,) for user_id in initial_admin_ids))
     con.commit(); con.close()
 
@@ -146,3 +167,44 @@ def add_admin(user_id):
 
 def remove_admin(user_id):
     con=connect(); con.execute("DELETE FROM admins WHERE user_id=?",(user_id,)); con.commit(); con.close()
+
+def create_giveaway(title, description):
+    con=connect(); cur=con.execute("INSERT INTO giveaways(title,description) VALUES(?,?)",(title,description)); con.commit(); giveaway_id=cur.lastrowid; con.close(); return giveaway_id
+
+def get_giveaways(status=None):
+    con=connect()
+    rows=con.execute("SELECT * FROM giveaways ORDER BY id DESC").fetchall() if status is None else con.execute("SELECT * FROM giveaways WHERE status=? ORDER BY id DESC",(status,)).fetchall()
+    con.close(); return rows
+
+def get_giveaway(giveaway_id):
+    con=connect(); row=con.execute("SELECT * FROM giveaways WHERE id=?",(giveaway_id,)).fetchone(); con.close(); return row
+
+def set_giveaway_status(giveaway_id, status, winner_text=None, winner_media_type=None, winner_media_id=None, winner_caption=None):
+    con=connect(); con.execute("UPDATE giveaways SET status=?,winner_text=COALESCE(?,winner_text),winner_media_type=COALESCE(?,winner_media_type),winner_media_id=COALESCE(?,winner_media_id),winner_caption=COALESCE(?,winner_caption),updated_at=CURRENT_TIMESTAMP,published_at=CASE WHEN ?='active' THEN published_at ELSE COALESCE(published_at,CURRENT_TIMESTAMP) END WHERE id=?",(status,winner_text,winner_media_type,winner_media_id,winner_caption,status,giveaway_id)); con.commit(); con.close()
+
+def create_announcement_job(created_by, source_chat_id, source_message_id, recipient_ids):
+    con=connect(); cur=con.execute("INSERT INTO announcement_jobs(created_by,source_chat_id,source_message_id,total) VALUES(?,?,?,?)",(created_by,source_chat_id,source_message_id,len(recipient_ids))); job_id=cur.lastrowid
+    con.executemany("INSERT OR IGNORE INTO announcement_deliveries(job_id,chat_id,queue_no) VALUES(?,?,?)",((job_id,chat_id,index % 10) for index,chat_id in enumerate(recipient_ids)))
+    con.commit(); con.close(); return job_id
+
+def get_announcement_job(job_id):
+    con=connect(); row=con.execute("SELECT * FROM announcement_jobs WHERE id=?",(job_id,)).fetchone(); con.close(); return row
+
+def start_announcement_job(job_id):
+    con=connect(); con.execute("UPDATE announcement_jobs SET status='running' WHERE id=? AND status='queued'",(job_id,)); con.commit(); con.close()
+
+def claim_announcement_delivery(job_id, queue_no):
+    con=connect()
+    row=con.execute("SELECT * FROM announcement_deliveries WHERE job_id=? AND queue_no=? AND status='pending' ORDER BY chat_id LIMIT 1",(job_id,queue_no)).fetchone()
+    if row:
+        con.execute("UPDATE announcement_deliveries SET status='sending',attempts=attempts+1,claimed_at=CURRENT_TIMESTAMP WHERE job_id=? AND chat_id=?",(job_id,row["chat_id"])); con.commit()
+    con.close(); return row
+
+def finish_announcement_delivery(job_id, chat_id, status, error=None):
+    con=connect(); con.execute("UPDATE announcement_deliveries SET status=?,last_error=?,sent_at=CASE WHEN ?='sent' THEN CURRENT_TIMESTAMP ELSE sent_at END WHERE job_id=? AND chat_id=?",(status,error,status,job_id,chat_id)); con.execute("UPDATE announcement_jobs SET sent=(SELECT COUNT(*) FROM announcement_deliveries WHERE job_id=? AND status='sent'),failed=(SELECT COUNT(*) FROM announcement_deliveries WHERE job_id=? AND status='failed'),blocked=(SELECT COUNT(*) FROM announcement_deliveries WHERE job_id=? AND status='blocked') WHERE id=?",(job_id,job_id,job_id,job_id)); con.commit(); con.close()
+
+def complete_announcement_job(job_id):
+    con=connect(); con.execute("UPDATE announcement_jobs SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=? AND NOT EXISTS (SELECT 1 FROM announcement_deliveries WHERE job_id=? AND status IN ('pending','sending'))",(job_id,job_id)); con.commit(); con.close()
+
+def recover_announcement_jobs():
+    con=connect(); con.execute("UPDATE announcement_deliveries SET status='pending',claimed_at=NULL WHERE status='sending'"); con.commit(); rows=con.execute("SELECT id FROM announcement_jobs WHERE status IN ('queued','running') ORDER BY id").fetchall(); con.close(); return [row["id"] for row in rows]
