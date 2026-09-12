@@ -2,7 +2,8 @@ import json
 import logging
 import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyKeyboardRemove
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, PollAnswerHandler, ChatMemberHandler, ContextTypes, filters
@@ -13,6 +14,7 @@ from config import BOT_TOKEN, ADMIN_IDS, OWNER_ID
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 STATE = {}
+ANNOUNCEMENT_DELAY = 0.1
 
 
 def is_admin(user_id):
@@ -28,6 +30,7 @@ def main_menu():
         [InlineKeyboardButton("📝 Poll Registration", callback_data="reg", style="success")],
         [InlineKeyboardButton("📋 Poll Details", callback_data="details", style="primary")],
         [InlineKeyboardButton("🏆 Poll Results", callback_data="results", style="primary")],
+        [InlineKeyboardButton("🎁 Giveaway", callback_data="giveaway", style="success")],
     ])
 
 
@@ -42,6 +45,7 @@ def admin_menu(owner=False):
         [InlineKeyboardButton("➕ Add Group", callback_data="admin_add", style="success"), InlineKeyboardButton("🗑 Remove Group", callback_data="admin_remove", style="danger")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats", style="primary")],
         [InlineKeyboardButton("📢 Announcement", callback_data="admin_announce", style="success")],
+        [InlineKeyboardButton("🎁 Giveaway", callback_data="admin_giveaway", style="success")],
     ]
     if owner:
         buttons.append([InlineKeyboardButton("👑 Manage Admins", callback_data="owner_admins", style="primary")])
@@ -66,6 +70,54 @@ def format_registration_names(poll_id):
     if not rows:
         return "None"
     return "\n".join(f"{index}. {row['name']}" for index, row in enumerate(rows, 1))
+
+
+def giveaway_text(giveaway):
+    text = f"🎁 *{giveaway['title']}*\n\n{giveaway['description']}"
+    if giveaway["winner_text"]:
+        text += f"\n\n🏆 *Result*\n{giveaway['winner_text']}"
+    return text
+
+
+async def send_giveaway_media(bot, chat_id, giveaway):
+    if giveaway["winner_media_type"] == "photo" and giveaway["winner_media_id"]:
+        await bot.send_photo(chat_id=chat_id, photo=giveaway["winner_media_id"], caption=giveaway["winner_caption"] or "🏆 Giveaway winner")
+
+
+def announcement_recipients():
+    return list(dict.fromkeys([row["user_id"] for row in db.get_users()] + [row["id"] for row in db.get_groups()]))
+
+
+async def broadcast_worker(bot, job_id, queue_no):
+    while True:
+        delivery = db.claim_announcement_delivery(job_id, queue_no)
+        if not delivery:
+            return
+        chat_id = delivery["chat_id"]
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=db.get_announcement_job(job_id)["source_chat_id"], message_id=db.get_announcement_job(job_id)["source_message_id"])
+        except RetryAfter as exc:
+            await asyncio.sleep(exc.retry_after)
+            db.finish_announcement_delivery(job_id, chat_id, "pending", str(exc))
+            continue
+        except Forbidden as exc:
+            db.finish_announcement_delivery(job_id, chat_id, "blocked", str(exc))
+        except Exception as exc:
+            db.finish_announcement_delivery(job_id, chat_id, "failed", str(exc))
+        else:
+            db.finish_announcement_delivery(job_id, chat_id, "sent")
+        await asyncio.sleep(ANNOUNCEMENT_DELAY)
+
+
+async def run_announcement(bot, job_id):
+    db.start_announcement_job(job_id)
+    await asyncio.gather(*(broadcast_worker(bot, job_id, queue_no) for queue_no in range(10)))
+    db.complete_announcement_job(job_id)
+    job = db.get_announcement_job(job_id)
+    try:
+        await bot.send_message(chat_id=job["created_by"], text=f"📢 Announcement completed\n\n👥 Total: {job['total']}\n✅ Sent: {job['sent']}\n❌ Failed: {job['failed']}\n🚫 Blocked/Unavailable: {job['blocked']}")
+    except Exception:
+        pass
 
 
 async def pin_message(context, chat_id, message_id):
@@ -198,6 +250,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE.pop(uid, None)
     u = update.effective_user
     db.save_user(uid, u.first_name, u.username)
+    try:
+        await context.bot.set_message_reaction(chat_id=update.effective_chat.id, message_id=update.message.message_id, reaction=[ReactionTypeEmoji("👍")])
+    except Exception:
+        pass
+    await update.message.reply_text("\u2063", reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text("🤖 *Poll Management Bot*\n\nChoose an option:", parse_mode="Markdown", reply_markup=main_menu())
     if is_admin(uid):
         await update.message.reply_text("⚙️ You are an admin. Use /admin to open the admin panel.")
@@ -267,6 +324,34 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "results":
         STATE.pop(uid, None)
         await q.edit_message_text("🏆 *Poll Results*\n\nSelect Group:", parse_mode="Markdown", reply_markup=group_keyboard("resg")); return
+    if data == "giveaway":
+        STATE.pop(uid, None)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎁 Current Giveaways", callback_data="giveaway_current", style="success")],
+            [InlineKeyboardButton("🏆 Giveaway Winners", callback_data="giveaway_winners", style="primary")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_main", style="primary")],
+        ])
+        await q.edit_message_text("🎁 *Giveaway*\n\nChoose what you want to view:", parse_mode="Markdown", reply_markup=keyboard)
+        return
+    if data == "giveaway_current":
+        current = db.get_giveaways("active")
+        if not current:
+            await q.edit_message_text("🎁 *Current Giveaways*\n\nNo current giveaways right now.", parse_mode="Markdown", reply_markup=single_back("giveaway")); return
+        text = "🎁 *Current Giveaways*\n\n" + "\n\n".join(giveaway_text(giveaway) for giveaway in current)
+        await q.edit_message_text(text[:4000], parse_mode="Markdown", reply_markup=single_back("giveaway"))
+        return
+    if data == "giveaway_winners":
+        completed = db.get_giveaways("completed")
+        if not completed:
+            await q.edit_message_text("🏆 *Giveaway Winners*\n\nNo giveaway winners posted yet.", parse_mode="Markdown", reply_markup=single_back("giveaway")); return
+        text = "🏆 *Giveaway Winners*\n\n" + "\n\n".join(giveaway_text(giveaway) for giveaway in completed)
+        await q.edit_message_text(text[:4000], parse_mode="Markdown", reply_markup=single_back("giveaway"))
+        for giveaway in completed:
+            try:
+                await send_giveaway_media(context.bot, uid, giveaway)
+            except Exception as exc:
+                logging.warning("Could not send giveaway winner media %s: %s", giveaway["id"], exc)
+        return
     if data.startswith("resg:"):
         gid = int(data.split(":")[1]); group = db.get_group(gid); polls = db.completed_polls(gid)
         if not polls:
@@ -470,6 +555,35 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_stats":
         s=db.stats(); await q.edit_message_text(f"📊 *Statistics*\n\nGroups: {s['groups']}\nPolls: {s['polls']}\nRegistrations: {s['registrations']}\nTracked votes: {s['votes']}",parse_mode="Markdown",reply_markup=single_back("back_admin")); return
+    if data == "admin_giveaway":
+        giveaways = db.get_giveaways()
+        keyboard = [[InlineKeyboardButton("➕ Add Giveaway", callback_data="giveaway_add", style="success")]]
+        for giveaway in giveaways:
+            keyboard.append([InlineKeyboardButton(f"#{giveaway['id']} {giveaway['title'][:35]} ({giveaway['status']})", callback_data=f"giveaway_manage:{giveaway['id']}", style="primary")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin", style="primary")])
+        await q.edit_message_text("🎁 *Giveaway Management*\n\nCreate, publish, or post results for giveaways.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)); return
+    if data == "giveaway_add":
+        STATE[uid] = {"action": "giveaway_title"}
+        await q.edit_message_text("🎁 *New Giveaway*\n\nSend the giveaway title.", parse_mode="Markdown", reply_markup=single_back("admin_giveaway")); return
+    if data.startswith("giveaway_manage:"):
+        giveaway = db.get_giveaway(int(data.split(":")[1]))
+        if not giveaway:
+            await q.edit_message_text("❌ Giveaway not found.", reply_markup=single_back("admin_giveaway")); return
+        keyboard = []
+        if giveaway["status"] == "active":
+            keyboard.append([InlineKeyboardButton("📢 Publish to Groups", callback_data=f"giveaway_publish:{giveaway['id']}", style="success")])
+            keyboard.append([InlineKeyboardButton("🏆 Post Winners", callback_data=f"giveaway_finish:{giveaway['id']}", style="primary")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_giveaway", style="primary")])
+        await q.edit_message_text(giveaway_text(giveaway), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)); return
+    if data.startswith("giveaway_publish:"):
+        giveaway = db.get_giveaway(int(data.split(":")[1]))
+        for group in db.get_groups():
+            await try_group_message(context, group["id"], giveaway_text(giveaway), parse_mode="Markdown")
+        db.set_giveaway_status(giveaway["id"], "active")
+        await q.edit_message_text("✅ Giveaway published to active groups.", reply_markup=single_back("admin_giveaway")); return
+    if data.startswith("giveaway_finish:"):
+        STATE[uid] = {"action": "giveaway_winner", "giveaway_id": int(data.split(":")[1])}
+        await q.edit_message_text("🏆 Send the giveaway winner(s) as text or upload a winner screenshot with an optional caption.", reply_markup=single_back("admin_giveaway")); return
     if data == "admin_announce":
         STATE[uid]={"action":"announcement"}
         await q.edit_message_text("📢 *Announcement*\n\nSend the message to broadcast.",parse_mode="Markdown",reply_markup=single_back("back_admin")); return
@@ -480,6 +594,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state: return
     if update.effective_chat.type != "private" and state["action"] != "name":
         return
+    text = update.message.text.strip()
     if state["action"]=="add_group":
         parts = update.message.text.split()
         if not parts:
@@ -499,29 +614,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Group added!\n\n{chat.title}\nID: {chat.id}\nUsername: @{username or getattr(chat, 'username', '') or 'none'}", reply_markup=single_back(back_callback, back_text)); return
     if state["action"]=="announcement":
         if not is_admin(uid): STATE.pop(uid,None); return
-        message=update.message.text
-        users=db.get_users(); groups=db.get_groups(); uok=ufail=gok=gfail=0
-        for u in users:
-            try: await context.bot.send_message(chat_id=u["user_id"],text=message); uok+=1; await asyncio.sleep(.05)
-            except Exception: ufail+=1
-        for g in groups:
-            try: await send_group_message(context, g["id"], message); gok+=1; await asyncio.sleep(.05)
-            except Exception: gfail+=1
-        STATE.pop(uid,None); await update.message.reply_text(f"✅ Announcement sent\n\n👤 DMs: {uok} sent, {ufail} failed\n👥 Groups: {gok} sent, {gfail} failed",reply_markup=single_back("back_admin","🔙 Back to Admin")); return
+        job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, announcement_recipients())
+        STATE.pop(uid,None)
+        asyncio.create_task(run_announcement(context.bot, job_id))
+        await update.message.reply_text(f"📢 Announcement started\n\n👥 Total: {db.get_announcement_job(job_id)['total']}\n\nThe announcement is running in the background.", reply_markup=single_back("back_admin","🔙 Back to Admin")); return
     if state["action"]=="admin_announcement":
         if not is_owner(uid):
             STATE.pop(uid,None); return
-        message = update.message.text
-        sent = failed = 0
-        for admin in db.get_admins():
-            try:
-                await context.bot.send_message(chat_id=admin["user_id"], text=message)
-                sent += 1
-                await asyncio.sleep(.05)
-            except Exception:
-                failed += 1
+        job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, [admin["user_id"] for admin in db.get_admins()])
         STATE.pop(uid,None)
-        await update.message.reply_text(f"✅ Admin announcement sent\n\n👑 Admins: {sent} sent, {failed} failed", reply_markup=single_back("back_admin", "🔙 Back to Admin")); return
+        asyncio.create_task(run_announcement(context.bot, job_id))
+        await update.message.reply_text("📢 Admin announcement started in the background.", reply_markup=single_back("back_admin", "🔙 Back to Admin")); return
     if state["action"]=="add_admin":
         if not is_owner(uid):
             STATE.pop(uid,None); return
@@ -534,7 +637,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add_admin(admin_id); STATE.pop(uid,None)
         await update.message.reply_text(f"✅ Admin added: {admin_id}", reply_markup=single_back("owner_admins")); return
 
-    text=update.message.text.strip()
+    if state["action"]=="giveaway_title":
+        state["title"] = text
+        state["action"] = "giveaway_description"
+        await update.message.reply_text("🎁 Send the giveaway description, rules, and prize details.", reply_markup=single_back("admin_giveaway")); return
+    if state["action"]=="giveaway_description":
+        giveaway_id = db.create_giveaway(state["title"], text)
+        STATE.pop(uid, None)
+        await update.message.reply_text(f"✅ Giveaway #{giveaway_id} created.", reply_markup=single_back("admin_giveaway")); return
+    if state["action"]=="giveaway_winner":
+        giveaway = db.get_giveaway(state["giveaway_id"])
+        db.set_giveaway_status(giveaway["id"], "completed", text)
+        for group in db.get_groups():
+            await try_group_message(context, group["id"], giveaway_text(db.get_giveaway(giveaway["id"])), parse_mode="Markdown")
+        STATE.pop(uid, None)
+        await update.message.reply_text("✅ Giveaway result published to active groups.", reply_markup=single_back("admin_giveaway")); return
+
     if state["action"]=="name":
         pid=state["poll_id"]
         ok,reason,count,slots=db.register(pid,uid,text)
@@ -575,6 +693,42 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = db.create_poll(state["group_id"], state["question"], [], slots)
         STATE.pop(uid,None)
         await update.message.reply_text(f"✅ *Poll Registration #{pid} created*\n\n🎟️ Slots: {'Unlimited' if slots==0 else slots}\n👥 Registration is OPEN.\n\nWhen registration is full it closes automatically. Otherwise use Admin → 🛑 Finish Registration.",parse_mode="Markdown",reply_markup=single_back("back_admin","🔙 Back to Admin")); return
+
+
+async def announcement_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = STATE.get(uid)
+    if not state or update.effective_chat.type != "private":
+        return
+    if state.get("action") == "giveaway_winner":
+        if not is_admin(uid) or not update.message.photo:
+            return
+        giveaway = db.get_giveaway(state["giveaway_id"])
+        caption = update.message.caption or "🏆 Giveaway winner"
+        db.set_giveaway_status(giveaway["id"], "completed", caption, "photo", update.message.photo[-1].file_id, caption)
+        completed = db.get_giveaway(giveaway["id"])
+        for group in db.get_groups():
+            await try_group_message(context, group["id"], giveaway_text(completed), parse_mode="Markdown")
+            try:
+                await send_giveaway_media(context.bot, group["id"], completed)
+            except Exception as exc:
+                logging.warning("Could not publish giveaway winner screenshot %s: %s", giveaway["id"], exc)
+        STATE.pop(uid, None)
+        await update.message.reply_text("✅ Giveaway winner screenshot published to active groups.", reply_markup=single_back("admin_giveaway"))
+        return
+    if state.get("action") not in ("announcement", "admin_announcement"):
+        return
+    if state["action"] == "admin_announcement" and not is_owner(uid):
+        STATE.pop(uid, None)
+        return
+    if state["action"] == "announcement" and not is_admin(uid):
+        STATE.pop(uid, None)
+        return
+    recipients = announcement_recipients() if state["action"] == "announcement" else [admin["user_id"] for admin in db.get_admins()]
+    job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, recipients)
+    STATE.pop(uid, None)
+    asyncio.create_task(run_announcement(context.bot, job_id))
+    await update.message.reply_text("📢 Announcement started in the background.", reply_markup=single_back("back_admin", "🔙 Back to Admin"))
 
 
 async def send_direct_poll(context, group_id, question, options, allows_multiple_answers=False):
@@ -634,10 +788,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start — main menu\n/addgroup — add a group\n/admin — admin panel for authorized admins")
 
 
+async def resume_announcements(application):
+    for job_id in db.recover_announcement_jobs():
+        application.create_task(run_announcement(application.bot, job_id))
+
+
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is missing in .env")
     db.init_db(set(ADMIN_IDS) | {OWNER_ID})
-    app=Application.builder().token(BOT_TOKEN).build()
+    app=Application.builder().token(BOT_TOKEN).post_init(resume_announcements).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("admin",admin_cmd))
     app.add_handler(CommandHandler("addgroup",add_group_cmd))
@@ -646,9 +805,10 @@ def main():
     app.add_handler(ChatMemberHandler(track_group_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.POLL, incoming_poll_handler))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.TEXT & ~filters.POLL & ~filters.COMMAND, announcement_media_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_message), group=1)
-    print("🤖 Bot is running...")
+    print("Bot is running...")
     app.run_polling()
 
 
