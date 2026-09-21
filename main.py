@@ -170,23 +170,45 @@ def parse_lucky_dip_names(text):
 
 
 async def run_lucky_dip(bot, group_id, names):
-    await bot.send_dice(chat_id=group_id, emoji="🎲")
-    await bot.send_message(
-        chat_id=group_id,
-        text="<blockquote>🎲 Winner announcement is coming soon.</blockquote>",
-        parse_mode="HTML",
-    )
-    countdown = await bot.send_message(chat_id=group_id, text="⏳ Winner announcing in 30 seconds...")
-    for seconds in range(30, -1, -1):
-        await countdown.edit_text(f"⏳ Winner announcing in {seconds} seconds...")
-        if seconds:
+    try:
+        try:
+            await bot.send_dice(chat_id=group_id, emoji="🎲")
+        except Exception as exc:
+            logging.warning("Could not send Lucky Dip dice to %s: %s", group_id, exc)
+
+        try:
+            await bot.send_message(
+                chat_id=group_id,
+                text="<blockquote>🎲✨ Winner announcement is coming soon.</blockquote>",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logging.warning("Could not send Lucky Dip intro to %s: %s", group_id, exc)
+
+        countdown = await bot.send_message(
+            chat_id=group_id,
+            text="⏳✨ <b>00:30</b>  •  🎲 Winner announcing soon...",
+            parse_mode="HTML",
+        )
+        for seconds in range(29, -1, -1):
             await asyncio.sleep(1)
-    winner = random.choice(names)
-    await bot.send_message(
-        chat_id=group_id,
-        text=f"<blockquote>🏆 The winner is: {escape(winner)}</blockquote>",
-        parse_mode="HTML",
-    )
+            minutes, remaining_seconds = divmod(seconds, 60)
+            try:
+                await countdown.edit_text(
+                    f"⏳✨ <b>{minutes:02d}:{remaining_seconds:02d}</b>  •  🎲 Winner announcing soon...",
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                logging.warning("Could not update Lucky Dip timer in %s: %s", group_id, exc)
+
+        winner = random.choice(names)
+        await bot.send_message(
+            chat_id=group_id,
+            text=f"<blockquote>🏆✨ The winner is: {escape(winner)}</blockquote>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logging.exception("Lucky Dip failed in group %s: %s", group_id, exc)
 
 
 async def verify_group_owner(context, chat_id, user_id):
