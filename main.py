@@ -185,13 +185,20 @@ async def run_lucky_dip(bot, group_id, names):
         except Exception as exc:
             logging.warning("Could not send Lucky Dip intro to %s: %s", group_id, exc)
 
-        countdown = await bot.send_message(
-            chat_id=group_id,
-            text="⏳✨ <b>00:30</b>  •  🎲 Winner announcing soon...",
-            parse_mode="HTML",
-        )
+        countdown = None
+        try:
+            countdown = await bot.send_message(
+                chat_id=group_id,
+                text="⏳✨ <b>00:30</b>  •  🎲 Winner announcing soon...",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logging.warning("Could not create Lucky Dip timer in %s: %s", group_id, exc)
+
         for seconds in range(29, -1, -1):
             await asyncio.sleep(1)
+            if countdown is None or seconds % 5:
+                continue
             minutes, remaining_seconds = divmod(seconds, 60)
             try:
                 await countdown.edit_text(
