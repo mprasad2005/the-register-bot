@@ -1,6 +1,9 @@
 import json
 import logging
 import asyncio
+import random
+import re
+from html import escape
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyKeyboardRemove
 from telegram.error import Forbidden, RetryAfter
@@ -46,6 +49,7 @@ def admin_menu(owner=False):
         [InlineKeyboardButton("➕ Add Group", callback_data="admin_add", style="success"), InlineKeyboardButton("🗑 Remove Group", callback_data="admin_remove", style="danger")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats", style="primary")],
         [InlineKeyboardButton("📢 Announcement", callback_data="admin_announce", style="success")],
+        [InlineKeyboardButton("🎲 Lucky Dip", callback_data="lucky_dip", style="success")],
         [InlineKeyboardButton("🎁 Giveaway", callback_data="admin_giveaway", style="success")],
     ]
     if owner:
@@ -86,7 +90,10 @@ async def send_giveaway_media(bot, chat_id, giveaway):
 
 
 def announcement_recipients():
-    return list(dict.fromkeys([row["user_id"] for row in db.get_users()] + [row["id"] for row in db.get_groups()]))
+    group_ids = [row["id"] for row in db.get_groups()]
+    user_ids = [row["user_id"] for row in db.get_users()]
+    recipients = [(chat_id, 0) for chat_id in group_ids] + [(user_id, 1) for user_id in user_ids]
+    return list(dict.fromkeys(recipients))
 
 
 async def broadcast_worker(bot, job_id, queue_no):
@@ -149,6 +156,37 @@ async def try_group_message(context, chat_id, text, parse_mode=None):
     except Exception as exc:
         logging.warning("Could not send group announcement to %s: %s", chat_id, exc)
         return None
+
+
+def parse_lucky_dip_names(text):
+    names = []
+    for line in text.splitlines():
+        name = re.sub(r"^\s*\d+\s*[.)-]?\s*", "", line).strip()
+        if name:
+            names.append(name)
+    if len(names) == 1 and "," in names[0]:
+        names = [name.strip() for name in names[0].split(",") if name.strip()]
+    return names
+
+
+async def run_lucky_dip(bot, group_id, names):
+    await bot.send_dice(chat_id=group_id, emoji="🎲")
+    await bot.send_message(
+        chat_id=group_id,
+        text="<blockquote>🎲 Winner announcement is coming soon.</blockquote>",
+        parse_mode="HTML",
+    )
+    countdown = await bot.send_message(chat_id=group_id, text="⏳ Winner announcing in 30 seconds...")
+    for seconds in range(30, -1, -1):
+        await countdown.edit_text(f"⏳ Winner announcing in {seconds} seconds...")
+        if seconds:
+            await asyncio.sleep(1)
+    winner = random.choice(names)
+    await bot.send_message(
+        chat_id=group_id,
+        text=f"<blockquote>🏆 The winner is: {escape(winner)}</blockquote>",
+        parse_mode="HTML",
+    )
 
 
 async def verify_group_owner(context, chat_id, user_id):
@@ -259,10 +297,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     db.save_user(uid, u.first_name, u.username)
     try:
-        await context.bot.set_message_reaction(chat_id=update.effective_chat.id, message_id=update.message.message_id, reaction=[ReactionTypeEmoji("👍")])
+        await context.bot.set_message_reaction(chat_id=update.effective_chat.id, message_id=update.message.message_id, reaction=[ReactionTypeEmoji("⚡")])
     except Exception:
         pass
-    await update.message.reply_text("\u2063", reply_markup=ReplyKeyboardRemove())
+    emoji_message = await update.message.reply_text("⚡", reply_markup=ReplyKeyboardRemove())
+    await asyncio.sleep(2)
+    try:
+        await emoji_message.delete()
+    except Exception:
+        pass
     await update.message.reply_text("🤖 *Poll Management Bot*\n\nChoose an option:", parse_mode="Markdown", reply_markup=main_menu())
     if is_admin(uid):
         await update.message.reply_text("⚙️ You are an admin. Use /admin to open the admin panel.")
@@ -597,6 +640,19 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_announce":
         STATE[uid]={"action":"announcement"}
         await q.edit_message_text("📢 *Announcement*\n\nSend the message to broadcast.",parse_mode="Markdown",reply_markup=single_back("back_admin")); return
+    if data == "lucky_dip":
+        STATE[uid] = {"action": "lucky_dip_names"}
+        await q.edit_message_text("🎲 *Lucky Dip*\n\nSend 2 to 15 names, one per line. Numbered names are supported, for example:\n`1. GPT`\n`2. Gemini`", parse_mode="Markdown", reply_markup=single_back("back_admin")); return
+    if data.startswith("lucky_group:"):
+        state = STATE.get(uid)
+        if not state or state.get("action") != "lucky_dip_group":
+            return
+        group_id = int(data.split(":")[1])
+        names = state["names"]
+        STATE.pop(uid, None)
+        await q.edit_message_text("🎲 Lucky Dip started. The winner will be announced in 30 seconds.", reply_markup=single_back("back_admin"))
+        asyncio.create_task(run_lucky_dip(context.bot, group_id, names))
+        return
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -631,7 +687,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state["action"]=="admin_announcement":
         if not is_owner(uid):
             STATE.pop(uid,None); return
-        job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, [admin["user_id"] for admin in db.get_admins()])
+        job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, [(admin["user_id"], 1) for admin in db.get_admins()])
         STATE.pop(uid,None)
         asyncio.create_task(run_announcement(context.bot, job_id))
         await update.message.reply_text("📢 Admin announcement started in the background.", reply_markup=single_back("back_admin", "🔙 Back to Admin")); return
@@ -662,6 +718,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.gather(*(try_group_message(context, group["id"], giveaway_text(completed), parse_mode="Markdown") for group in db.get_groups()))
         STATE.pop(uid, None)
         await update.message.reply_text("✅ Giveaway result published to active groups.", reply_markup=single_back("admin_giveaway")); return
+
+    if state["action"] == "lucky_dip_names":
+        names = parse_lucky_dip_names(text)
+        if not 2 <= len(names) <= 15:
+            await update.message.reply_text("❌ Send between 2 and 15 names, one per line.", reply_markup=single_back("back_admin")); return
+        state["action"] = "lucky_dip_group"
+        state["names"] = names
+        await update.message.reply_text("✅ Names received. Select the group where the winner should be announced:", reply_markup=group_keyboard("lucky_group", "back_admin")); return
 
     if state["action"]=="name":
         pid=state["poll_id"]
@@ -736,7 +800,7 @@ async def announcement_media_handler(update: Update, context: ContextTypes.DEFAU
     if state["action"] == "announcement" and not is_admin(uid):
         STATE.pop(uid, None)
         return
-    recipients = announcement_recipients() if state["action"] == "announcement" else [admin["user_id"] for admin in db.get_admins()]
+    recipients = announcement_recipients() if state["action"] == "announcement" else [(admin["user_id"], 1) for admin in db.get_admins()]
     job_id = db.create_announcement_job(uid, update.effective_chat.id, update.message.message_id, recipients)
     STATE.pop(uid, None)
     asyncio.create_task(run_announcement(context.bot, job_id))

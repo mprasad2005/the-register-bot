@@ -41,6 +41,7 @@ def init_db(initial_admin_ids=()):
     );
     CREATE TABLE IF NOT EXISTS announcement_deliveries (
         job_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, queue_no INTEGER NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 1,
         status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
         sent_at TEXT, claimed_at TEXT, PRIMARY KEY(job_id,chat_id), FOREIGN KEY(job_id) REFERENCES announcement_jobs(id)
     );
@@ -52,6 +53,7 @@ def init_db(initial_admin_ids=()):
     cols={r[1] for r in con.execute("PRAGMA table_info(polls)").fetchall()}
     group_cols={r[1] for r in con.execute("PRAGMA table_info(groups)").fetchall()}
     giveaway_cols={r[1] for r in con.execute("PRAGMA table_info(giveaways)").fetchall()}
+    announcement_delivery_cols={r[1] for r in con.execute("PRAGMA table_info(announcement_deliveries)").fetchall()}
     if "username" not in group_cols: con.execute("ALTER TABLE groups ADD COLUMN username TEXT")
     if "telegram_poll_id" not in cols: con.execute("ALTER TABLE polls ADD COLUMN telegram_poll_id TEXT")
     if "slots" not in cols: con.execute("ALTER TABLE polls ADD COLUMN slots INTEGER NOT NULL DEFAULT 0")
@@ -61,6 +63,7 @@ def init_db(initial_admin_ids=()):
     if "winner_media_type" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_media_type TEXT")
     if "winner_media_id" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_media_id TEXT")
     if "winner_caption" not in giveaway_cols: con.execute("ALTER TABLE giveaways ADD COLUMN winner_caption TEXT")
+    if "priority" not in announcement_delivery_cols: con.execute("ALTER TABLE announcement_deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 1")
     con.executemany("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", ((user_id,) for user_id in initial_admin_ids))
     con.executemany("INSERT OR IGNORE INTO groups(id,title) VALUES(?,?)", INITIAL_GROUPS)
     con.commit(); con.close()
@@ -193,9 +196,9 @@ def get_giveaway(giveaway_id):
 def set_giveaway_status(giveaway_id, status, winner_text=None, winner_media_type=None, winner_media_id=None, winner_caption=None):
     con=connect(); con.execute("UPDATE giveaways SET status=?,winner_text=COALESCE(?,winner_text),winner_media_type=COALESCE(?,winner_media_type),winner_media_id=COALESCE(?,winner_media_id),winner_caption=COALESCE(?,winner_caption),updated_at=CURRENT_TIMESTAMP,published_at=CASE WHEN ?='active' THEN published_at ELSE COALESCE(published_at,CURRENT_TIMESTAMP) END WHERE id=?",(status,winner_text,winner_media_type,winner_media_id,winner_caption,status,giveaway_id)); con.commit(); con.close()
 
-def create_announcement_job(created_by, source_chat_id, source_message_id, recipient_ids):
-    con=connect(); cur=con.execute("INSERT INTO announcement_jobs(created_by,source_chat_id,source_message_id,total) VALUES(?,?,?,?)",(created_by,source_chat_id,source_message_id,len(recipient_ids))); job_id=cur.lastrowid
-    con.executemany("INSERT OR IGNORE INTO announcement_deliveries(job_id,chat_id,queue_no) VALUES(?,?,?)",((job_id,chat_id,index % 10) for index,chat_id in enumerate(recipient_ids)))
+def create_announcement_job(created_by, source_chat_id, source_message_id, recipients):
+    con=connect(); cur=con.execute("INSERT INTO announcement_jobs(created_by,source_chat_id,source_message_id,total) VALUES(?,?,?,?)",(created_by,source_chat_id,source_message_id,len(recipients))); job_id=cur.lastrowid
+    con.executemany("INSERT OR IGNORE INTO announcement_deliveries(job_id,chat_id,queue_no,priority) VALUES(?,?,?,?)",((job_id,chat_id,index % 10,priority) for index,(chat_id,priority) in enumerate(recipients)))
     con.commit(); con.close(); return job_id
 
 def get_announcement_job(job_id):
@@ -206,7 +209,7 @@ def start_announcement_job(job_id):
 
 def claim_announcement_delivery(job_id, queue_no):
     con=connect()
-    row=con.execute("SELECT * FROM announcement_deliveries WHERE job_id=? AND queue_no=? AND status='pending' ORDER BY chat_id LIMIT 1",(job_id,queue_no)).fetchone()
+    row=con.execute("SELECT * FROM announcement_deliveries WHERE job_id=? AND queue_no=? AND status='pending' AND (priority=0 OR NOT EXISTS (SELECT 1 FROM announcement_deliveries WHERE job_id=? AND priority=0 AND status IN ('pending','sending'))) ORDER BY priority,chat_id LIMIT 1",(job_id,queue_no,job_id)).fetchone()
     if row:
         con.execute("UPDATE announcement_deliveries SET status='sending',attempts=attempts+1,claimed_at=CURRENT_TIMESTAMP WHERE job_id=? AND chat_id=?",(job_id,row["chat_id"])); con.commit()
     con.close(); return row
