@@ -642,7 +642,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📢 *Announcement*\n\nSend the message to broadcast.",parse_mode="Markdown",reply_markup=single_back("back_admin")); return
     if data == "lucky_dip":
         STATE[uid] = {"action": "lucky_dip_names"}
-        await q.edit_message_text("🎲 *Lucky Dip*\n\nSend 2 to 15 names, one per line. Numbered names are supported, for example:\n`1. GPT`\n`2. Gemini`", parse_mode="Markdown", reply_markup=single_back("back_admin")); return
+        await q.edit_message_text("🎲 *Lucky Dip*\n\nSend 2 to 15 names, one per line.", parse_mode="Markdown", reply_markup=single_back("back_admin")); return
     if data.startswith("lucky_group:"):
         state = STATE.get(uid)
         if not state or state.get("action") != "lucky_dip_group":
